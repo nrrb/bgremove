@@ -2,7 +2,7 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import ImageUpload from './components/ImageUpload.vue'
 import {
-  createMask, smoothMask, applyMask, rasterizeLine, floodFill,
+  rasterizeLine, floodFill,
   computeGradientMap, computeLivewire, traceLivewirePath,
 } from './utils/backgroundRemoval.js'
 
@@ -21,7 +21,7 @@ const hasResult = ref(false)
 const samplingMode = ref(false)
 const skinColors = ref([])
 const threshold = ref(DEFAULT_THRESHOLD)
-const smoothEdges = ref(true)
+const smoothEdges = ref(false)
 
 // Lasso tool
 const lineMode = ref(false)
@@ -38,9 +38,99 @@ const brushMode = ref(false)
 const brushSize = ref(20)
 const brushPainting = ref(false)
 
+// Segmentation worker
+let _worker = null
+let _workerSeq = 0
+
+function getWorker() {
+  if (!_worker) {
+    _worker = new Worker(new URL('./utils/segmentationWorker.js', import.meta.url), { type: 'module' })
+  }
+  return _worker
+}
+
 // History
 const historySnaps = ref([])
 const historyIdx = ref(-1)
+
+// Zoom / pan
+const zoomScale = ref(1)
+const panX = ref(0)
+const panY = ref(0)
+const canvasAreaRef = ref(null)
+
+let _pinchActive = false
+let _pinchStartDist = 0
+let _pinchStartScale = 1
+let _panActive = false
+let _panOriginX = 0
+let _panOriginY = 0
+let _lastTapTime = 0
+
+const canvasWrapperStyle = computed(() => {
+  if (zoomScale.value === 1 && panX.value === 0 && panY.value === 0) return {}
+  return {
+    transform: `translate(${panX.value}px, ${panY.value}px) scale(${zoomScale.value})`,
+    transformOrigin: '50% 50%',
+    willChange: 'transform',
+  }
+})
+
+function resetZoom() {
+  zoomScale.value = 1
+  panX.value = 0
+  panY.value = 0
+}
+
+function pinchDist(touches) {
+  const dx = touches[0].clientX - touches[1].clientX
+  const dy = touches[0].clientY - touches[1].clientY
+  return Math.hypot(dx, dy)
+}
+
+function onAreaTouchStart(e) {
+  if (e.touches.length === 2) {
+    _pinchActive = true
+    _panActive = false
+    _pinchStartDist = pinchDist(e.touches)
+    _pinchStartScale = zoomScale.value
+    e.preventDefault()
+  } else if (e.touches.length === 1) {
+    const now = Date.now()
+    if (now - _lastTapTime < 280 && zoomScale.value > 1) {
+      resetZoom()
+      _lastTapTime = 0
+      return
+    }
+    _lastTapTime = now
+    const noDrawTool = !samplingMode.value && !lineMode.value && !brushMode.value
+    if (zoomScale.value > 1 && noDrawTool) {
+      _panActive = true
+      _panOriginX = e.touches[0].clientX - panX.value
+      _panOriginY = e.touches[0].clientY - panY.value
+    }
+  }
+}
+
+function onAreaTouchMove(e) {
+  if (_pinchActive && e.touches.length === 2) {
+    const dist = pinchDist(e.touches)
+    const next = Math.min(8, Math.max(1, _pinchStartScale * (dist / _pinchStartDist)))
+    zoomScale.value = next
+    if (next <= 1) { panX.value = 0; panY.value = 0 }
+    e.preventDefault()
+  } else if (_panActive && e.touches.length === 1) {
+    panX.value = e.touches[0].clientX - _panOriginX
+    panY.value = e.touches[0].clientY - _panOriginY
+    e.preventDefault()
+  }
+}
+
+function onAreaTouchEnd(e) {
+  if (e.touches.length < 2) _pinchActive = false
+  if (e.touches.length < 1) _panActive = false
+  if (e.touches.length === 0 && zoomScale.value < 1.05) resetZoom()
+}
 
 // Derived
 const canUndo = computed(() => historyIdx.value > 0)
@@ -107,7 +197,7 @@ function handleImageLoaded(img) {
   const canvas = canvasRef.value
   canvas.width = img.naturalWidth
   canvas.height = img.naturalHeight
-  canvas.getContext('2d').drawImage(img, 0, 0)
+  canvas.getContext('2d', { willReadFrequently: true }).drawImage(img, 0, 0)
   saveSnapshot()
 }
 
@@ -134,16 +224,39 @@ function applySegmentation() {
   ctx.clearRect(0, 0, canvas.width, canvas.height)
   ctx.drawImage(img, 0, 0)
   const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height)
-  let mask = createMask(imageData, skinColors.value, threshold.value)
-  if (smoothEdges.value) mask = smoothMask(mask, canvas.width, canvas.height, SMOOTH_RADIUS)
-  applyMask(imageData, mask)
-  ctx.putImageData(imageData, 0, 0)
-  hasResult.value = true
+  const seq = ++_workerSeq
+  const w = canvas.width, h = canvas.height
+  const worker = getWorker()
+  worker.onmessage = ({ data }) => {
+    if (data.seq !== seq) return
+    ctx.putImageData(new ImageData(new Uint8ClampedArray(data.pixelBuffer), w, h), 0, 0)
+    hasResult.value = true
+  }
+  worker.postMessage({
+    seq,
+    pixelBuffer: imageData.data.buffer,
+    width: w,
+    height: h,
+    referenceColors: skinColors.value.map(c => [c[0], c[1], c[2]]),
+    threshold: threshold.value,
+    doSmooth: smoothEdges.value,
+    smoothRadius: SMOOTH_RADIUS,
+  }, [imageData.data.buffer])
+}
+
+let segmentationTimer = null
+function debouncedApplySegmentation() {
+  clearTimeout(segmentationTimer)
+  segmentationTimer = setTimeout(applySegmentation, 500)
 }
 
 watch([() => skinColors.value.length, threshold, smoothEdges], () => {
-  if (skinColors.value.length > 0) applySegmentation()
+  if (skinColors.value.length > 0) debouncedApplySegmentation()
 })
+
+function removeSampleColor(index) {
+  skinColors.value = skinColors.value.filter((_, i) => i !== index)
+}
 
 function handleCanvasClick(e) {
   if (!samplingMode.value) return
@@ -267,7 +380,7 @@ function enterLineMode() {
   const off = document.createElement('canvas')
   off.width = img.naturalWidth
   off.height = img.naturalHeight
-  const ctx = off.getContext('2d')
+  const ctx = off.getContext('2d', { willReadFrequently: true })
   ctx.drawImage(img, 0, 0)
   gradMap.value = computeGradientMap(ctx.getImageData(0, 0, off.width, off.height), off.width, off.height)
 }
@@ -455,8 +568,25 @@ function onKeyDown(e) {
   }
 }
 
-onMounted(() => window.addEventListener('keydown', onKeyDown))
-onUnmounted(() => window.removeEventListener('keydown', onKeyDown))
+onMounted(() => {
+  window.addEventListener('keydown', onKeyDown)
+  const el = canvasAreaRef.value
+  if (el) {
+    el.addEventListener('touchstart', onAreaTouchStart, { passive: false })
+    el.addEventListener('touchmove', onAreaTouchMove, { passive: false })
+    el.addEventListener('touchend', onAreaTouchEnd)
+  }
+})
+onUnmounted(() => {
+  window.removeEventListener('keydown', onKeyDown)
+  const el = canvasAreaRef.value
+  if (el) {
+    el.removeEventListener('touchstart', onAreaTouchStart)
+    el.removeEventListener('touchmove', onAreaTouchMove)
+    el.removeEventListener('touchend', onAreaTouchEnd)
+  }
+  if (_worker) { _worker.terminate(); _worker = null }
+})
 
 // Sync overlay size when it becomes visible
 watch(showOverlay, async (val) => {
@@ -468,8 +598,8 @@ watch(showOverlay, async (val) => {
   <div class="h-dvh flex flex-col bg-neutral-900 text-neutral-100 overflow-hidden select-none">
 
     <!-- Canvas area -->
-    <div class="flex-1 min-h-0 overflow-auto flex items-start justify-center p-3">
-      <div class="relative rounded-xl overflow-hidden bg-checker inline-block max-w-full" :class="cursorClass">
+    <div ref="canvasAreaRef" class="flex-1 min-h-0 overflow-hidden flex items-center justify-center p-3 touch-none">
+      <div class="relative rounded-xl overflow-hidden bg-checker inline-block max-w-full" :class="cursorClass" :style="canvasWrapperStyle">
         <canvas
           ref="canvasRef"
           class="block max-w-full h-auto"
@@ -509,7 +639,10 @@ watch(showOverlay, async (val) => {
         <template v-if="activeToolPanel === 'sample'">
           <div class="flex items-center gap-3">
             <span class="text-xs text-neutral-400 shrink-0 w-28">Threshold: <strong class="text-neutral-200">{{ threshold }}</strong></span>
-            <input type="range" min="10" max="200" v-model.number="threshold" class="flex-1 accent-blue-500" />
+            <div class="flex items-center gap-1.5">
+              <button @click="threshold = Math.max(10, threshold - 10)" class="pill-btn px-3">−</button>
+              <button @click="threshold = Math.min(200, threshold + 10)" class="pill-btn px-3">+</button>
+            </div>
           </div>
           <label class="flex items-center gap-2 text-sm text-neutral-300">
             <input type="checkbox" v-model="smoothEdges" class="accent-blue-500" />
@@ -518,8 +651,10 @@ watch(showOverlay, async (val) => {
           <div v-if="skinColors.length > 0" class="flex items-center flex-wrap gap-1.5">
             <div
               v-for="([r, g, b], i) in skinColors" :key="i"
-              class="w-5 h-5 rounded border border-neutral-600 shrink-0"
+              class="w-5 h-5 rounded border border-neutral-600 shrink-0 cursor-pointer hover:opacity-60 hover:scale-90 transition-all"
               :style="{ background: `rgb(${r},${g},${b})` }"
+              title="Click to remove"
+              @click="removeSampleColor(i)"
             />
             <span class="text-xs text-neutral-500">{{ skinColors.length }} sample{{ skinColors.length !== 1 ? 's' : '' }}</span>
           </div>
@@ -567,7 +702,7 @@ watch(showOverlay, async (val) => {
         <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
           <path d="M9 3H5a2 2 0 0 0-2 2v4m6-6h10a2 2 0 0 1 2 2v4M9 3v18m0 0h10a2 2 0 0 0 2-2V9M9 21H5a2 2 0 0 1-2-2V9m0 0h18"/>
         </svg>
-        Sample
+        Keep Color
       </button>
 
       <button class="tbtn" :class="{ active: lineMode }" @click="toggleLasso" :disabled="!hasImage">
