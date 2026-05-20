@@ -1,6 +1,6 @@
 # ✂️ bgremove: Background Removal for Artists
 
-**[Open the app → bgr.surge.sh](https://bgr.surge.sh/)** · **[Docs & README → nrrb.github.io/bgremove](https://nrrb.github.io/bgremove/)**
+**[Open the app → bgr.surge.sh](https://bgr.surge.sh/)** · **[Docs & README → this page](https://nrrb.github.io/bgremove/)** · **[Code → github.com/nrrb/bgremove](https://www.github.com/nrrb/bgremove)**
 
 A free, browser-based tool for cutting subjects out of photos and saving them as transparent PNGs, perfect for reference prep, digital collage, painting studies, texture layering, and more. No account needed, no uploads, no waiting. Everything runs on your device.
 
@@ -81,7 +81,7 @@ The **Help** button in the bottom toolbar opens this page in a new tab so you ca
 ## Running locally
 
 ```bash
-git clone https://github.com/nicholasbennett/bgremove
+git clone https://github.com/nrrb/bgremove
 cd bgremove
 npm install
 npm run dev
